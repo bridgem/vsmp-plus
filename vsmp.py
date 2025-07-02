@@ -2,6 +2,7 @@ import configargparse
 import ffmpeg
 import logging
 import os
+import re
 import modules.utils as utils
 from modules.videoinfo import ImageInfo, VideoInfo
 from modules.twinepd import TwinEpd
@@ -60,9 +61,35 @@ def changed_ip_check(config, db):
             config['display'].append('ip')
             utils.write_db(db, utils.DB_CONFIGURATION, config)
 
+def find_next_non_black_frame(video_path, start_time, num_frames, fps):
+    # This ffmpeg method is unreliable for low num_frames (e.g. 2), 
+    # Use fps as a minimum value
+
+    num_frames = max(num_frames, int(fps))
+    # Find the end of a black segment after a given time
+    try:
+        out, err = (
+            ffmpeg
+            .input(video_path, ss=start_time)
+            .output('pipe:', vf='blackdetect=d=0.1:pic_th=0.98', format='null', vframes=num_frames, an=None)
+            .global_args('-hide_banner')
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+
+        pattern = re.compile(r'black_start:(\d+(?:\.\d+)?)\s+black_end:(\d+(?:\.\d+)?)')
+
+        for line in err.decode().splitlines():
+            match = pattern.search(line)
+            if match:
+                return float(match.group(1)), float(match.group(2))
+    except ffmpeg.Error as e:
+        logging.error(f"Blank frame detection FFmpeg error: {e.stderr.decode()}")
+                      
+    return None
 
 def generate_frame(in_filename, out_filename, time):
     try:
+        # Extract the given frame
         ffmpeg.input(in_filename, ss=time) \
               .filter('scale', 'iw*sar', 'ih') \
               .filter('scale', width, height, force_original_aspect_ratio=1) \
@@ -193,38 +220,80 @@ def update_display(config, epd, db):
         pil_im = Image.open(grabFile).resize((width, height))
 
     else:
-        validImg = False
+        logging.info(f"Loading {media_file['file']}")
 
-        while(not validImg):
-            logging.info(f"Loading {media_file['file']}")
+        if(media_file['pos'] >= media_file['info']['frame_count']):
+            # set 'next' to true to force new video file
+            media_file = find_next_file(config, utils.read_db(db, utils.DB_LAST_PLAYED_FILE), True)
+            # Reset pos to start
+            media_file['pos'] = config['start'] * media_file['info']['fps']
 
-            if(media_file['pos'] >= media_file['info']['frame_count']):
-                # set 'next' to true to force new video file
-                media_file = find_next_file(config, utils.read_db(db, utils.DB_LAST_PLAYED_FILE), True)
+        # calculate the percent percent_complete
+        media_file['percent_complete'] = (media_file['pos'] / media_file['info']['frame_count']) * 100
 
-            # calculate the percent percent_complete
-            media_file['percent_complete'] = (media_file['pos'] / media_file['info']['frame_count']) * 100
+        # set the position we want to use
+        frame = media_file['pos']
 
-            # set the position we want to use
-            frame = media_file['pos']
+        # Convert that frame to ms from start of video (frame/fps) * 1000
+        msTimecode = f"{utils.frames_to_seconds(frame, media_file['info']['fps']) * 1000}ms"
 
-            # Convert that frame to ms from start of video (frame/fps) * 1000
-            msTimecode = f"{utils.frames_to_seconds(frame, media_file['info']['fps']) * 1000}ms"
+        # Use ffmpeg to extract a frame from the movie, crop it, letterbox it and save it in memory
+        generate_frame(media_file['file'], grabFile, msTimecode)
 
-            # Use ffmpeg to extract a frame from the movie, crop it, letterbox it and save it in memory
-            generate_frame(media_file['file'], grabFile, msTimecode)
+        # Open grab.jpg in PIL
+        pil_im = Image.open(grabFile)
 
-            # save the next position
-            media_file['pos'] = media_file['pos'] + float(config['increment'])
+        # image not valid if skipping blank (None == blank)
+        if config['skip_blank'] and pil_im.getbbox() is None:
 
-            # Open grab.jpg in PIL
-            pil_im = Image.open(grabFile)
+            logging.info('Image is all black, skipping to next good frame')
 
-            # image not valid if skipping blank (None == blank)
-            validImg = (not config['skip_blank']) or (pil_im.getbbox() is not None and config['skip_blank'])
+            while True:
 
-            if(not validImg):
-                logging.info('Image is all black, try again')
+                # Get next non-blank frame after timecode within next frame increment
+                # Use ffmpeg to find the next non-blank instead of looping a fetch for each frame
+                # Could just get next frame increment, but ffmpeg allows use to search for the end of the blank sequence
+                blanks = find_next_non_black_frame(media_file['file'], msTimecode, config['increment'], media_file['info']['fps'])
+
+                if blanks is None:
+                    break
+                else:
+                    # We're on a blank frame
+                    blank_start, blank_end = blanks
+
+                    secsTimecode = float(msTimecode.rstrip("ms")) / 1000
+                    frame = secsTimecode * media_file['info']['fps']
+
+                    next_non_blank_frame = frame + utils.seconds_to_frames(blank_end, media_file['info']['fps'])
+                    
+                    logging.info(f"Black frame skip to {next_non_blank_frame}")
+
+                    if next_non_blank_frame < media_file['info']['frame_count']:
+                        # Jump to end of blank period
+                        frame = next_non_blank_frame
+                        media_file['pos'] = frame
+                    # else all the remaining frames are blank and the increment will take care of moving
+                    # to next file (dir mode) or reset to beginning (file mode):
+                    
+                    # Recalculate msTimecode again if we skipped some blank frames
+                    msTimecode = f"{utils.frames_to_seconds(frame, media_file['info']['fps']) * 1000}ms"
+
+                    # Generate new frame at end of black section
+                    generate_frame(media_file['file'], grabFile, msTimecode)
+
+                    # Fetch new image in PIL
+                    pil_im = Image.open(grabFile)
+
+        # save the next position
+        media_file['pos'] = media_file['pos'] + float(config['increment'])
+
+        # If the current values in the database have changed since the start of update_display,
+        # then a change has been (such as a seek or an api/db update). So we do not write back the calculated
+        # values for the next run
+        media_file_now = find_next_file(config, utils.read_db(db, utils.DB_LAST_PLAYED_FILE))
+        if media_file_now['pos'] == last_pos:
+            utils.write_db(db, utils.DB_LAST_PLAYED_FILE, media_file)
+
 
     if(len(config['display']) > 0):
         font18 = ImageFont.truetype(utils.FONT_PATH, 18)
@@ -266,22 +335,16 @@ def update_display(config, epd, db):
     if(config['media'] == 'video'):
         # do some calculations for the next run
         secondsOfVideo = utils.frames_to_seconds(frame, media_file['info']['fps'])
-        logging.info(f"Diplaying frame {frame} ({secondsOfVideo} seconds) of {media_file['name']}")
+        logging.info(f"Displaying frame {frame} ({secondsOfVideo} seconds) of {media_file['name']}")
 
         if(media_file['pos'] >= media_file['info']['frame_count']):
             # set 'next' to True to force new file
             media_file = find_next_file(config, utils.read_db(db, utils.DB_LAST_PLAYED_FILE), True)
+            # Reset pos to start
+            media_file['pos'] = config['start'] * media_file['info']['fps']
             logging.info(f"Will start {media_file} on next run")
     else:
         logging.info(f"Displaying {media_file['name']}")
-
-    # If the current values in the database have changed since the start of update_display,
-    # then a change has been (such as a seek or an api/db update). So we do not write back the calculated
-    # values for the next run
-    media_file_now = find_next_file(config, utils.read_db(db, utils.DB_LAST_PLAYED_FILE))
-    if media_file_now['pos'] == last_pos:
-        # save the last played info
-        utils.write_db(db, utils.DB_LAST_PLAYED_FILE, media_file)
 
     epd.sleep()
 

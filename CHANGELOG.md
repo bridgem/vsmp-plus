@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
+## 2025-07-02
+### Fixed
+- Skipping blank frames did not advance. Changed logic of main loop in update_display and use new function to get ffmpeg to find the next non-black frame.
+
 ## 2025-05-31
 
 ### Fixed
