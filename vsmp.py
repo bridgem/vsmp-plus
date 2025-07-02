@@ -2,6 +2,7 @@ import configargparse
 import ffmpeg
 import logging
 import os
+import fcntl, struct
 import re
 import modules.utils as utils
 from modules.videoinfo import ImageInfo, VideoInfo
@@ -13,11 +14,13 @@ import threading
 import redis
 import socket
 import shutil
+import qrcode
 import modules.webapp as webapp
 from omni_epd import displayfactory
 from croniter import croniter
 from datetime import datetime, timedelta
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance, ImageStat
+
 
 # create the tmp directory if it doesn't exist
 if (not os.path.exists(utils.TMP_DIR)):
@@ -89,14 +92,40 @@ def find_next_non_black_frame(video_path, start_time, num_frames, fps):
 
 def generate_frame(in_filename, out_filename, time):
     try:
-        # Extract the given frame
-        ffmpeg.input(in_filename, ss=time) \
-              .filter('scale', 'iw*sar', 'ih') \
-              .filter('scale', width, height, force_original_aspect_ratio=1) \
-              .filter('pad', width, height, -1, -1) \
-              .output(out_filename, vframes=1) \
-              .overwrite_output() \
-              .run(capture_stdout=True, capture_stderr=True)
+        scale_method = 3
+        match scale_method:
+            case 1:
+                # Original
+                ffmpeg.input(in_filename, ss=time) \
+                    .filter('scale', 'iw*sar', 'ih') \
+                    .filter('scale', width, height, force_original_aspect_ratio=1) \
+                    .filter('pad', width, height, -1, -1) \
+                    .output(out_filename, vframes=1) \
+                    .overwrite_output() \
+                    .run(capture_stdout=True, capture_stderr=True)
+            case 2:                
+                # Don't pad to add the black bars until after enhancement
+                ffmpeg.input(in_filename, ss=time) \
+                      .filter('scale', 'iw*sar', 'ih') \
+                      .filter('scale', width, height, force_original_aspect_ratio=1) \
+                      .output(out_filename, vframes=1) \
+                      .overwrite_output() \
+                      .run(capture_stdout=True, capture_stderr=True)
+            case 3:
+                # Crop images to fill display
+                screen_aspect_ratio = f'{width}/{height}'
+                scale_filter = (
+                    f"scale='if(gt(a,{screen_aspect_ratio}),-1,{width})':"
+                    f"'if(gt(a,{screen_aspect_ratio}),{height},-1)'"
+                )
+                crop_filter = f"crop={width}:{height}"
+                full_filter = f"{scale_filter},{crop_filter}"
+                ffmpeg.input(in_filename, ss=time) \
+                      .output(out_filename, vframes=1, vf=full_filter) \
+                      .overwrite_output() \
+                      .run(capture_stdout=True, capture_stderr=True)
+
+
     except ffmpeg.Error as e:
         logging.error(e.stderr.decode('utf-8'))
 
@@ -151,38 +180,114 @@ def find_next_file(config, lastPlayed, next=False):
     return result
 
 
+def enhance_image(img):
+    # EXPERIMENTAL
+    # Apply auto contract & brightness to output image
+    MIN_MEAN_BRIGHT = 0
+    MAX_MEAN_BRIGHT = 190
+    TARGET_BRIGHTNESS = 128         # Target mean brightness (e.g., 128 for mid-gray)
+
+    stat = ImageStat.Stat(img.convert("L"))
+    logging.debug(f"1: Frame           Mean Brightness = {stat.mean[0]:6.2f}")
+    logging.debug(f"1:                        Contrast = {stat.stddev[0]:6.2f}")
+
+    # Auto contrast
+    img = ImageOps.autocontrast(img)
+
+    # Calculate mean brightness
+    stat = ImageStat.Stat(img.convert("L"))
+    mean_brightness = stat.mean[0]
+    
+    logging.debug(f"2: Auto contrast ->     Brightness = {mean_brightness:6.2f}")
+    logging.debug(f"2:                        Contrast = {stat.stddev[0]:6.2f}")
+
+    if MIN_MEAN_BRIGHT < mean_brightness < MAX_MEAN_BRIGHT:
+        target_brightness = TARGET_BRIGHTNESS
+        # target_brightness = min(TARGET_BRIGHTNESS, 3 * mean_brightness)
+
+        # Don't overbrighten dark images
+        adjustment_factor = min(3, target_brightness / mean_brightness)
+    
+        logging.debug(f"3: Adjust brightness        Target = {target_brightness:6.2f}")
+        logging.debug(f"3: Adjust brightness,       Factor = {adjustment_factor:6.2f}")
+
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(adjustment_factor)
+    
+        stat = ImageStat.Stat(img.convert("L"))
+        logging.debug(f"3: Adjust brightness -> Brightness = {stat.mean[0]:6.2f}")
+    else:
+        logging.debug(f"3: (Brightness Unchanged)")
+    
+    return img
+
+
+def pad_image(img, target_size, color=0):
+    # TODO: Incorporate this in enhance_image?
+
+    # Pad given Pillow Image to the target_size (width, height), centering it.
+    target_width, target_height = target_size
+    original_width, original_height = img.size
+
+    result = Image.new(img.mode, target_size, color)
+    
+    # Center the original image on the new canvas
+    x = (target_width - original_width) // 2
+    y = (target_height - original_height) // 2
+    result.paste(img, (x, y))
+    
+    return result
+
+
 def show_startup(epd, db, messages=[]):
     epd.prepare()
 
     # display startup message on the display
     font30 = ImageFont.truetype(utils.FONT_PATH, 30)
-    font24 = ImageFont.truetype(utils.FONT_PATH, 24)
+    font_normal = ImageFont.truetype(utils.FONT_PATH, 18)
 
     current_ip = utils.read_db(db, utils.CURRENT_IP)
-    messages.append(f"Configure at http://{current_ip['ip']}:{args.port}")
+    config_url = f"http://{current_ip['ip']}:{args.port}/setup"
+    messages.append(f"Go to {config_url}")
 
     # load a background image
-    splash_image = os.path.join(utils.DIR_PATH, "web", "static", "images", "splash.jpg")
+    splash_image = os.path.join(utils.DIR_PATH, "web", "static", "images", "splash.png")
     background_image = Image.open(splash_image).resize((width, height))
 
     draw = ImageDraw.Draw(background_image)
 
-    # calculate the size of the text we're going to draw
+    # Calculate the size of the text we're going to draw
     title = "VSMP+"
     left, top, right, bottom = draw.textbbox((0, 0), text=title, font=font30)
     tw, th = right - left, bottom - top
 
-    draw.text(((width - tw) / 2, (height - th) / 4), title, font=font30, fill=0)
+    # Center on RH Half of image
+    draw.text((3 * width / 4 - tw / 2, (height - th) / 4), title, font=font30, fill=0)
 
     offset = th * 1.5  # initial offset is height of title plus spacer
     for m in messages:
-        left, top, right, bottom = draw.textbbox((0, 0), text=m, font=font24)
+        left, top, right, bottom = draw.textbbox((0, 0), text=m, font=font_normal)
         mw, mh = right - left, bottom - top
-        draw.text(((width - mw) / 2, (height - mh) / 4 + offset), m, font=font24, fill=0)
+        draw.text((3 * width / 4 - mw / 2, (height - mh) / 4 + offset), m, font=font_normal, fill=0)
         offset = offset + (th * 1.5)
 
-    epd.display(background_image)
+    # Create QR code instance
+    qr = qrcode.QRCode(
+        version=1,  # Controls size (1 to 40), 1 is smallest
+        error_correction=qrcode.constants.ERROR_CORRECT_M,  # L, M, Q, H (higher = more robust, bigger QR)
+        box_size=6,  # Pixel size of each "box"
+        border=4      # Thickness of the border (minimum is 4)
+    )
+    qr.add_data(config_url)
+    qr.make(fit=True)
 
+    # Generate the image
+    qr_img = qr.make_image(fill_color="black", back_color="white")
+    qw, qh = qr_img.size
+
+    background_image.paste(qr_img, (3 * width // 4 - qw // 2, height // 2))
+
+    epd.display(background_image)
     epd.sleep()
 
 
@@ -190,8 +295,9 @@ def update_display(config, epd, db):
 
     # get the file to display
     media_file = find_next_file(config, utils.read_db(db, utils.DB_LAST_PLAYED_FILE))
-    # Save pos to cehck for db changes later
+    # Save pos to check for db changes later
     last_pos = media_file['pos']
+    last_file = media_file['file']
 
     # check if we have a properly analyzed file
     if('file' not in media_file):
@@ -204,9 +310,6 @@ def update_display(config, epd, db):
         utils.write_db(db, utils.DB_PLAYER_STATUS, {'running': False})
 
         return
-
-    # Initialize the screen
-    epd.prepare()
 
     # save grab file in memory as a bitmap
     pil_im = None
@@ -327,10 +430,17 @@ def update_display(config, epd, db):
         left, top, right, bottom = draw.textbbox((0, 0), text=message, font=font18)
         tw, th = right - left, bottom - top  # gets the width and height of the text drawn
         # draw timecode, centering on the middle
-        draw.text(((width - tw) / 2, height - th), message, font=font18, fill=(255, 255, 255))
 
-    # display the image
+        # Black background rectangle behind text for visibility
+        x1, y1 = (width - tw) / 2, height - th
+        x2, y2 = (width + tw) / 2, height
+        # draw.rectangle([(x1-2, y1-2), (x2+2, y2+2)], fill=(0, 0, 0))
+        draw.text((x1, y1), message, font=font18, fill=(255, 255, 255))
+
+    # Initialize the screen & display the image
+    epd.prepare()
     epd.display(pil_im)
+    epd.sleep()
 
     if(config['media'] == 'video'):
         # do some calculations for the next run
@@ -342,10 +452,37 @@ def update_display(config, epd, db):
             media_file = find_next_file(config, utils.read_db(db, utils.DB_LAST_PLAYED_FILE), True)
             # Reset pos to start
             media_file['pos'] = config['start'] * media_file['info']['fps']
+
+            # MBRIDGE - shouldn't we reset the pos to the beginning?
+            # REMOVE - not needed bc of commit 1916043 branch
+                            # media_file['pos'] = config['start'] * media_file['info']['fps']
+                            # utils.write_db(db, utils.DB_LAST_PLAYED_FILE, media_file)
+
             logging.info(f"Will start {media_file} on next run")
     else:
         logging.info(f"Displaying {media_file['name']}")
 
+    # If the current values in the database have changed since the start of update_display,
+    # then a change has been (such as a seek or an api/db update). So we do not write back the calculated
+    # values for the next run
+
+    # REMOVE - check against previous commit: 1916043 
+                        # media_file_now = find_next_file(config, utils.read_db(db, utils.DB_LAST_PLAYED_FILE))
+                        
+                        # if media_file_now['file'] != last_file:
+                        #     # We are now on a new file
+                        #     utils.write_db(db, utils.DB_LAST_PLAYED_FILE, media_file)
+                        # else:
+                        #     # Same file, but only write if we haven't done a seek
+                        #     if media_file_now['pos'] == last_pos:
+                        #         # save the last played info
+                        #         media_file['pos'] = next_pos
+                        #         utils.write_db(db, utils.DB_LAST_PLAYED_FILE, media_file)
+                        #         pass
+                        #     else:
+                        #         # Got a seek, so don't update DB
+                        #         pass
+    
     epd.sleep()
 
 
@@ -438,7 +575,7 @@ logging.info(f"Next Update: {nextUpdate} based on last update {datetime.fromtime
 # show the startup screen for 1 min before proceeding
 if(config['startup_screen']):
     logging.info("Showing startup screen")
-    show_startup(epd, db, [f"Next Update: {nextUpdate.strftime('%m/%d at %H:%M')}"])
+    show_startup(epd, db, [f"Next Update: {nextUpdate.strftime('%d/%m/%Y at %H:%M')}"])
     time.sleep(60)
 
 # reset cronitor to current time

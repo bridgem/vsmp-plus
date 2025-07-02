@@ -5,3 +5,16 @@ __pycache__/*
 modules/__pycache__/*
 waveshare_lib/build/*
 waveshare_lib/dist/*
+custom-conf.conf
+debug.log
+mbridge-changelog.md
+test_app.py
+test_frame.py
+.idea/.gitignore
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml
+.idea/vsmp-plus.iml
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/inspectionProfiles/Project_Default.xml
+web/static/images/original-splash.jpg
