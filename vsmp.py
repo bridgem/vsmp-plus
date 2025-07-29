@@ -387,6 +387,14 @@ def update_display(config, epd, db):
                     # Fetch new image in PIL
                     pil_im = Image.open(grabFile)
 
+        w, h = pil_im.size
+        logging.debug(f"Image size: {w} px, Height: {h} px")
+        pil_im = enhance_image(pil_im)
+
+        # Pad image with black bars to screen size if needed
+        # This is so that the enhancement doesn't include the black bars    
+        pil_im = pad_image(pil_im, (width, height), color=(0, 0, 0))
+
         # save the next position
         media_file['pos'] = media_file['pos'] + float(config['increment'])
 
@@ -432,8 +440,8 @@ def update_display(config, epd, db):
         # draw timecode, centering on the middle
 
         # Black background rectangle behind text for visibility
-        x1, y1 = (width - tw) / 2, height - th
-        x2, y2 = (width + tw) / 2, height
+        x1, y1 = (width - tw) / 2, height - th - 20
+        x2, y2 = (width + tw) / 2, height - 20
         # draw.rectangle([(x1-2, y1-2), (x2+2, y2+2)], fill=(0, 0, 0))
         draw.text((x1, y1), message, font=font18, fill=(255, 255, 255))
 
@@ -596,7 +604,11 @@ while 1:
 
     # check if the display should be updated
     pStatus = utils.read_db(db, utils.DB_PLAYER_STATUS)
-    if(nextUpdate <= now):
+    # MBRIDGE NO DELAY
+    # if(nextUpdate <= now):
+    if(True):
+        logging.debug("Ignoring cron!!")
+
         if(pStatus['running']):
             update_display(config, epd, db)
             utils.write_db(db, utils.DB_LAST_RUN, {'last_run': now.timestamp()})
@@ -610,4 +622,7 @@ while 1:
         changed_ip_check(config, db)
 
     # sleep for one minute
-    time.sleep(60 - datetime.now().second)
+    # MBRIDGE NO DELAY
+    # time.sleep(60 - datetime.now().second)
+    logging.debug("Sleep 1")
+    time.sleep(1)
