@@ -440,13 +440,14 @@ def update_display(config, epd, db):
         # draw timecode, centering on the middle
 
         # Black background rectangle behind text for visibility
-        x1, y1 = (width - tw) / 2, height - th - 20
-        x2, y2 = (width + tw) / 2, height - 20
-        # draw.rectangle([(x1-2, y1-2), (x2+2, y2+2)], fill=(0, 0, 0))
+        x1, y1 = (width - tw) / 2, height - th
+        x2, y2 = (width + tw) / 2, height
+        draw.rectangle([(x1-2, y1-2), (x2+2, y2+2)], fill=(0, 0, 0))
         draw.text((x1, y1), message, font=font18, fill=(255, 255, 255))
 
     # Initialize the screen & display the image
     epd.prepare()
+    logging.debug("Updating EPD")
     epd.display(pil_im)
     epd.sleep()
 
@@ -469,29 +470,6 @@ def update_display(config, epd, db):
             logging.info(f"Will start {media_file} on next run")
     else:
         logging.info(f"Displaying {media_file['name']}")
-
-    # If the current values in the database have changed since the start of update_display,
-    # then a change has been (such as a seek or an api/db update). So we do not write back the calculated
-    # values for the next run
-
-    # REMOVE - check against previous commit: 1916043 
-                        # media_file_now = find_next_file(config, utils.read_db(db, utils.DB_LAST_PLAYED_FILE))
-                        
-                        # if media_file_now['file'] != last_file:
-                        #     # We are now on a new file
-                        #     utils.write_db(db, utils.DB_LAST_PLAYED_FILE, media_file)
-                        # else:
-                        #     # Same file, but only write if we haven't done a seek
-                        #     if media_file_now['pos'] == last_pos:
-                        #         # save the last played info
-                        #         media_file['pos'] = next_pos
-                        #         utils.write_db(db, utils.DB_LAST_PLAYED_FILE, media_file)
-                        #         pass
-                        #     else:
-                        #         # Got a seek, so don't update DB
-                        #         pass
-    
-    epd.sleep()
 
 
 # parse the arguments
@@ -604,10 +582,7 @@ while 1:
 
     # check if the display should be updated
     pStatus = utils.read_db(db, utils.DB_PLAYER_STATUS)
-    # MBRIDGE NO DELAY
-    # if(nextUpdate <= now):
-    if(True):
-        logging.debug("Ignoring cron!!")
+    if(nextUpdate <= now):
 
         if(pStatus['running']):
             update_display(config, epd, db)
@@ -622,7 +597,4 @@ while 1:
         changed_ip_check(config, db)
 
     # sleep for one minute
-    # MBRIDGE NO DELAY
-    # time.sleep(60 - datetime.now().second)
-    logging.debug("Sleep 1")
-    time.sleep(1)
+    time.sleep(60 - datetime.now().second)
